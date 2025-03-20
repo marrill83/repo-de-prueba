@@ -1,0 +1,1215 @@
+#SCRIPT SOLO INPUTS
+from sqlalchemy import create_engine
+import pandas as pd
+from pandas import DataFrame
+import csv
+import sqlite3
+import datetime
+import os
+import numpy as np
+import re
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import calendar
+import time
+import zipfile
+import shutil
+import warnings
+print(f"EL SCRIPT CORRE EN EL PATH: {os.getcwd()}")
+# Ignorar todas las advertencias
+warnings.filterwarnings('ignore')
+# Atencion! Controlar nombre de la descarga
+
+
+###################################### modificar ###########################
+#Modificar al mes analizado 
+brightpear_tax_ordes = pd.read_csv("sales-export-marzo.csv")
+
+num_rows = 80
+gc = gspread.service_account(filename='C:/Users/marin/Downloads/ROBOT_TM/credential_sheets_MR.json')
+sh = gc.open('inputs simulador v2')
+start_row = 3
+#cambiar filas y columnas 4b
+cell_range = f'Q{start_row}:Q{num_rows + start_row}'
+
+start_column = 17
+
+############################################################################
+
+
+clothing_categories = ['Clothing, Shoes & Jewelry','Coats and jackets','Footwear','Clothing','Plus Sizes','Sunglasses','Jewelry','Watches','Handmade Products','Shoes','Shoe', 'Jewelry & Watch Accessories']
+electronics_categories = ['Electronics','Cell Phones & Accessories','Computers/Tablets & Networking','eBay Motors','Consumer Electronics','Cameras & Photo','Car & Vehicle Electronics']
+home_garden_categories = ['Tools & Home Improvement','Home & Kitchen','Patio, Lawn & Garden','Appliances','Home & Garden','Kitchen & Dining']
+sports_outdoors_categories = ['Sports & Outdoors','Toys & Games','Toys & Hobbies','Sporting Goods','Outdoor Recreation','Sports Mem, Cards & Fan Shop']
+books_categories = ['Books','book','books','Book']
+general_categories = ['General', 'Everything Else', 'Travel', 'Food Service Equipment & Supplies','']
+
+def map_categories(category):
+    if pd.isna(category):
+        return 'Unknown'
+    elif any(keyword in category for keyword in clothing_categories):
+        return 'Clothing & Accessories'
+    elif any(keyword in category for keyword in electronics_categories):
+        return 'Electronics'
+    elif any(keyword in category for keyword in home_garden_categories):
+        return 'Home & Garden'
+    elif any(keyword in category for keyword in sports_outdoors_categories):
+        return 'Sports & Outdoors'
+    elif any(keyword in category for keyword in books_categories):
+        return 'Books'
+    else:
+        return 'General'
+    
+    
+def determinar_mixta(skus):
+    count_mkt = 0
+    count_not_mkt = 0
+
+    for sku in skus:
+        if sku.startswith('MKT'):
+            count_mkt += 1
+        else:
+            count_not_mkt += 1
+
+    if count_mkt > 0 and count_not_mkt > 0:
+        return 'mixta'
+    elif count_mkt > 0:
+        return 'mkt'
+    else:
+        return 'legacy'
+
+def group_categories(category):
+    if category in ['Books']:
+        return 'Books'
+    elif category in ['Electronics', 'Video Games', 'Consoles & Video Games ','Cell Phones & Accessories', 'Software'
+                      , 'Cameras','Computers & Accessories ']:
+        return 'Tech'
+    else:
+        return 'General'
+    
+def modificar_region(row):
+    if row['country'] == 'Arg Coar' or row['country'] == 'Argentina' and row['region'] == 'Capital Federal':
+        return 'CABA'
+    else:
+        return 'Interior'
+    
+def convert_scientific_to_float(value):
+    return format(float(value), '.2f')
+
+directory = os.getcwd()
+
+brightpear_tax_ordes.rename(columns={'Ref':'order_id','Necesita Tramite de URSEC':'ursec'},inplace=True)
+brightpear_tax_ordes = brightpear_tax_ordes[['Tax date','order_id','Order ID','Parent Order','ursec','Total']]
+brightpear_tax_ordes['Order ID'] = brightpear_tax_ordes['Order ID'].astype(str)
+
+orders = brightpear_tax_ordes['order_id'].astype(str).tolist()
+list_orders = ','.join("'" + order + "'" for order in orders)
+
+brightpear_tax_ordes.fillna('',inplace=True)
+
+print(" Comienzo de querys")
+
+# Connect to the database
+engine = create_engine("mysql+pymysql://marina.radice:Yekivicunum*93@prod-db-replica.tiendamia.net/tiendamia",
+                       connect_args= dict(host='prod-magento2-replica.tiendamia.net', port=3306))
+conn = engine.connect()
+
+# Execute the query
+query = (f"""
+
+SELECT    
+    JSON_UNQUOTE(JSON_EXTRACT(p.`data`, '$.create_date')) AS created_at,
+    JSON_UNQUOTE(JSON_EXTRACT(p.`data`, '$.order_id')) AS order_id,
+    JSON_UNQUOTE(item.value->'$.vendor_sku') AS sku,
+    JSON_UNQUOTE(item.value->'$.pricing_rules.rules[0].rule_name') AS range_markup,
+    JSON_UNQUOTE(item.value->'$.quantity') AS item_quantity,
+    JSON_UNQUOTE(item.value->'$.weight') AS item_weight,
+    JSON_UNQUOTE(item.value->'$.total_price') AS price_markup_qty_m2,
+    JSON_UNQUOTE(item.value->'$.unit_price') AS price_markup_m2,
+    JSON_UNQUOTE(item.value->'$.pricing_rules.rules[0].price_markup') AS markup_m2,
+    JSON_UNQUOTE(item.value->'$.pricing_rules.merchant_price') AS amz_price_m2
+FROM  
+    tiendamia_postsales_order p 
+CROSS JOIN JSON_TABLE(
+        p.`data`,
+        '$.items[*]' COLUMNS (
+            value JSON PATH '$'
+        )
+) AS item
+WHERE
+    JSON_UNQUOTE(JSON_EXTRACT(p.`data`, '$.order_id')) IN ({list_orders}) 
+""")
+
+cursor = conn.execute(query)
+
+# Fetch the results and convert to a list of dictionaries
+results = [dict(row) for row in cursor.fetchall()]
+
+# Create a DataFrame
+magento_2_ori = pd.DataFrame(results)
+magento_2 = magento_2_ori.copy()
+
+user = 'marina.radice'  
+password = 'Yekivicunum*93'
+host = 'data-analytics.tiendamia.net'
+port = 5439 
+database = 'dev' 
+
+engine = create_engine(f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}")
+
+
+conn = engine.connect()
+
+# Execute the query
+query = (f"""
+SELECT 
+    mo.created_at_gmt_3,
+    mo.country,
+    mo.increment_id as order_id,
+    mo.courier,
+    mo.payment_method,
+    mo.items_ordered as total_items,
+    mo.gmv as gmv_order,
+    moi.sku,
+    moi.item_name,
+    moi.qty_ordered,
+    moi.gmv_item,
+    moi.item_vendor_price as po_price,
+    moi.item_charged_products so_price,
+    moi.item_fx_ordered as fx_item,
+    mo.charged_shipping_last_mile + mo.charged_shipping_handling + mo.charged_shipping_tiendamia_tariff + mo.charged_shipping_paid_weight + mo.charged_shipping_userccost as income_shipping,
+    moi.item_charged_shipping_userccost item_ursec,
+    moi.item_charged_shipping_last_mile + item_charged_shipping_handling + item_charged_shipping_tiendamia_tariff + item_charged_shipping_paid_weight + item_charged_shipping_userccost as item_ship_income,
+    moi.row_weight weight,
+    mo.regime,
+    mo.transport_mean,
+    c.category as category_c,
+    moi.category,
+    md.real_weight,
+    moi.region,
+    mo.shipping_method_clean shipping_method_clean_v1
+FROM 
+    tm_common.m1_orders mo
+LEFT JOIN 
+    tm_common.m1_order_item moi on mo.increment_id = moi.increment_id
+LEFT JOIN
+    tm_business.category_mkp c on c.sku = moi.sku
+LEFT JOIN 
+    tm_common.manifest_data md on md.order_mgt = mo.increment_id
+where 
+    mo.increment_id  in ({list_orders})
+ """)
+
+cursor = conn.execute(query)
+
+# Fetch the results and convert to a list of dictionaries
+results = [dict(row) for row in cursor.fetchall()]
+
+# Create a DataFrame
+redshift_m1_1 = pd.DataFrame(results)
+
+
+# Connect to the database
+engine = create_engine("mysql+pymysql://marina.radice:Yekivicunum*93@prod-db-replica.tiendamia.net/tiendamia7",
+                       connect_args= dict(host='prod-db-replica.tiendamia.net', port=3306))
+conn = engine.connect()
+
+# Execute the query
+query = (f"""
+ SELECT 
+     increment_id as order_id,
+     sfoi.description as sku, 
+     cast(JSON_EXTRACT(sfoi.additional_data,'$.subsidio') as float ) as subsidio
+from 
+    sales_flat_order_item as sfoi 
+join 
+    sales_flat_order as sfo on sfoi.order_id = sfo.entity_id
+WHERE 
+    increment_id in ({list_orders})
+""")
+
+cursor = conn.execute(query)
+
+# Fetch the results and convert to a list of dictionaries
+results = [dict(row) for row in cursor.fetchall()]
+
+# Create a DataFrame
+subsidio_1 = pd.DataFrame(results)
+subsidio = subsidio_1.copy()
+
+conn = engine.connect()
+
+# Execute the query
+query = (f"""
+ SELECT op.order_id , opp.custom_sku sku,opp.commission comission , warehouseId , real_qty
+from 
+    op_f35_orders_to_purchase op 
+LEFT JOIN
+    op_f35_orders_to_purchase_product opp on opp.op_order_to_purchase_id = op.id
+WHERE 
+    order_id in ({list_orders})
+""")
+
+cursor = conn.execute(query)
+
+# Fetch the results and convert to a list of dictionaries
+results = [dict(row) for row in cursor.fetchall()]
+
+# Create a DataFrame
+comision_wh_1 = pd.DataFrame(results)
+
+print(" Terminaron las primeras querys")
+
+comision_wh = comision_wh_1.copy()
+
+comision_wh['Warehouse'] = comision_wh['warehouseId'].apply(lambda x: 'Miami' if x == 6 
+                                                            else ('China' if x == 13 
+                                                                  else ('Miami' if x == 14 
+                                                                        else 'Mexico' if x == 15 else 'Other')))
+
+comision_wh.drop(columns={'warehouseId'},inplace=True)
+
+comision_wh['sku'] = comision_wh['sku'].apply(lambda x: x.replace('|', '') if x.startswith('EBAY') else x)
+comision_wh['sku'] = comision_wh['sku'].str.upper()
+
+warehouse = comision_wh[['order_id','Warehouse']].drop_duplicates()
+comision_wh = comision_wh.drop_duplicates()
+
+###########################
+
+redshift_m1 = redshift_m1_1.copy()
+
+redshift_m1['sku'] = redshift_m1['sku'].str.upper()
+
+redshift_m1.loc[redshift_m1['category_c'].isin(['Cell Phones & Accessories ']), 'category_c'] = 'Cell Phones & Accessories'
+
+redshift_m1 = redshift_m1[redshift_m1['sku']==redshift_m1['sku']]
+
+redshift_m1 = redshift_m1.merge(comision_wh[['order_id','comission','sku']],'left',['order_id','sku']).merge(subsidio,'left',['order_id','sku']).merge(warehouse,'left','order_id')
+redshift_m1['sku'] = redshift_m1['sku'].str.upper()
+
+###########################
+
+subsidio.fillna(0,inplace=True)
+
+subsidio['subsidio'] = subsidio['subsidio'].apply(convert_scientific_to_float)
+subsidio['subsidio'] = subsidio['subsidio'].astype(float).round(2)
+
+subsidio['sku'] = subsidio['sku'].str.upper()
+subsidio = subsidio.drop_duplicates()
+
+################
+
+redshift_m1['subsidio'].fillna(0,inplace=True)
+redshift_m1['so_price'] = redshift_m1['so_price'].astype(float) + redshift_m1['subsidio'].astype(float)
+redshift_m1['markup'] = round(redshift_m1['so_price'].astype(float) - redshift_m1['po_price'].astype(float),2)
+redshift_m1['mixta'] = redshift_m1.groupby('order_id')['sku'].transform(determinar_mixta)
+redshift_m1['region'] = redshift_m1.apply(modificar_region, axis=1)
+redshift_m1['sku'] = redshift_m1['sku'].astype(str)
+
+ebay = redshift_m1[redshift_m1['sku'].str.startswith('EBAY')]
+ebay.rename(columns={'qty_ordered':'ebay'},inplace=True)
+ebay = ebay[['order_id','sku','ebay']]
+
+redshift_m1 = redshift_m1.merge(ebay,'left',['order_id','sku'])
+
+redshift_m1['category_group'] = redshift_m1['category'].apply(lambda x: group_categories(x))
+redshift_m1['top_category'] = redshift_m1['category'].apply(lambda x: x.split(' > ')[0] if pd.notna(x) else None)
+redshift_m1['category_map'] = redshift_m1['top_category'].apply(lambda x: map_categories(x))
+
+redshift_m1.loc[redshift_m1['courier'].isin(['correoar', 'china-correoar','ahiva_ar']), 'country'] = 'Arg Coar'
+redshift_m1.loc[redshift_m1['courier'].isin(['china-ulg_barco','ulg_barco']), 'country'] = 'Imports_barco'
+redshift_m1.loc[redshift_m1['courier'].isin(['ulg_logistics']), 'country'] = 'Imports_avion'
+
+redshift_m1 = redshift_m1.merge(brightpear_tax_ordes,'left','order_id')
+
+redshift_m1.loc[(redshift_m1['ursec']=='yes'), 'ursec'] = 1
+redshift_m1.loc[(redshift_m1['ursec']!=1), 'ursec'] = 0
+
+redshift_m1['shipping_method_clean'] = ''
+
+redshift_m1.loc[redshift_m1['shipping_method_clean_v1'].str.contains('customship', case=False), 'shipping_method_clean'] = 'Envío normal a domicilio'
+redshift_m1.loc[redshift_m1['shipping_method_clean_v1'].str.contains('CorreoStore', case=False), 'shipping_method_clean'] = 'Envío normal a domicilio'
+redshift_m1.loc[redshift_m1['shipping_method_clean_v1'].str.contains('Correo Argentino', case=False), 'shipping_method_clean'] = 'Envío normal a domicilio'
+redshift_m1.loc[redshift_m1['shipping_method_clean_v1'].str.contains('pickupcenter', case=False), 'shipping_method_clean'] = 'Pick up'
+redshift_m1.loc[redshift_m1['shipping_method_clean_v1'].str.contains('express', case=False), 'shipping_method_clean'] = 'Express Domicilio'
+redshift_m1.loc[redshift_m1['shipping_method_clean_v1'].str.contains('expresspickup', case=False), 'shipping_method_clean'] = 'Express Pick up'
+redshift_m1.loc[redshift_m1['shipping_method_clean_v1'].str.contains('importacionesAvion', case=False), 'shipping_method_clean'] = 'avion'
+redshift_m1.loc[redshift_m1['shipping_method_clean_v1'].str.contains('importacionesBarco', case=False), 'shipping_method_clean'] = 'barco'
+
+all_countries = pd.DataFrame({'country': ["Arg Coar", "Argentina", "Brazil", "Ecuador", "Peru", "Uruguay", "Imports", "Costa Rica"]})
+
+
+legacy_m1 = redshift_m1[~redshift_m1['sku'].str.startswith('MKT')]
+legacy_m1_order = legacy_m1.drop_duplicates('order_id')
+
+mkt_m1_ch = redshift_m1[(redshift_m1['sku'].str.startswith('MKT'))&(redshift_m1['Warehouse']=='China')]
+mkt_m1_order_ch = mkt_m1_ch.drop_duplicates('order_id')
+
+mkt_m1_mia = redshift_m1[(redshift_m1['sku'].str.startswith('MKT'))&(redshift_m1['Warehouse']=='Miami')]
+mkt_m1_order_mia = mkt_m1_mia.drop_duplicates('order_id')
+
+mixtas = redshift_m1[redshift_m1['mixta']=='mixta']
+mixtas_m1_order = mixtas.drop_duplicates('order_id')
+
+mixtas_no_mkt = mixtas[~mixtas['sku'].str.startswith('MKT')].groupby(
+    'country')['qty_ordered'].sum().reset_index().rename(columns={'qty_ordered':'legacy'})
+
+mixtas_mkt = mixtas[mixtas['sku'].str.startswith('MKT')].groupby(
+    'country')['qty_ordered'].sum().reset_index().rename(columns={'qty_ordered':'mkt'})
+
+mixtas_grouped = mixtas.groupby('country')['qty_ordered'].sum().reset_index().rename(columns={'qty_ordered':'total'})
+
+merge_mixtas = mixtas_grouped.merge(mixtas_mkt,'left','country').merge(mixtas_no_mkt,'left','country')
+
+magento_2_wh = magento_2.merge(comision_wh[['order_id','sku','Warehouse']],'left',['order_id','sku'])
+
+country_mapping = {'EC': 'Ecuador','CR':'Costa Rica'}
+
+magento_2_wh['country'] = magento_2_wh['order_id'].str[:2].map(country_mapping)
+magento_2_wh['item_quantity'] = magento_2_wh['item_quantity'].astype(float)
+
+magento_2_wh['mixta'] = magento_2_wh.groupby('order_id')['sku'].transform(determinar_mixta)
+
+legacy_m2 = magento_2_wh[~magento_2_wh['sku'].str.startswith('MKT')]
+legacy_m2_order = legacy_m2.drop_duplicates('order_id')
+
+mkt_m2_ch = magento_2_wh[(magento_2_wh['sku'].str.startswith('MKT'))&(magento_2_wh['Warehouse']=='China')]
+mkt_m2_order_ch = mkt_m2_ch.drop_duplicates('order_id')
+
+mkt_m2_mia = magento_2_wh[(magento_2_wh['sku'].str.startswith('MKT'))&(magento_2_wh['Warehouse']=='Miami')]
+mkt_m2_order_mia = mkt_m2_mia.drop_duplicates('order_id')
+
+mixtas_m2 = magento_2_wh[magento_2_wh['mixta']=='mixta']
+mixtas_m2_order = mixtas_m2.drop_duplicates('order_id')
+
+mixtas_no_mkt_m2 = mixtas_m2[~magento_2_wh['sku'].str.startswith('MKT')].groupby('country')['item_quantity'].sum().reset_index().rename(columns={'item_quantity':'legacy'})
+
+mixtas_mkt_m2 = mixtas_m2[magento_2_wh['sku'].str.startswith('MKT')].groupby('country')['item_quantity'].sum().reset_index().rename(columns={'item_quantity':'mkt'})
+
+mixtas_m2 = mixtas_m2.groupby('country')['item_quantity'].sum().reset_index().rename(columns={'item_quantity':'total'})
+
+merge_mixtas_m2 = mixtas_m2.merge(mixtas_mkt_m2,'left','country').merge(mixtas_no_mkt_m2,'left','country')
+
+mixtas_df = pd.concat([merge_mixtas,merge_mixtas_m2])
+
+mixtas_df[['total','mkt','legacy']] = mixtas_df[['total','mkt','legacy']].astype(float)
+mixtas_df = mixtas_df.groupby('country')[['total','mkt','legacy']].sum().reset_index()
+
+mixtas_df['legacy'] = mixtas_df['legacy'].astype(float) / mixtas_df['total'].astype(float) 
+mixtas_df['mkt'] = mixtas_df['mkt'].astype(float) / mixtas_df['total'].astype(float) 
+
+
+legacy_m1[['qty_ordered','ebay','ursec','po_price','so_price']] = legacy_m1[['qty_ordered','ebay','ursec','po_price','so_price']].astype(float)
+
+legacy_grouped_m1_1 = legacy_m1.groupby(['country']).agg({
+    'order_id':'nunique',
+    'qty_ordered':'sum',
+    'ebay':'sum',
+    'weight':'sum',
+    'po_price':'sum',
+    'so_price':'sum'}).reset_index()
+
+
+all_countries = pd.DataFrame({'country': ["Arg Coar", "Argentina", "Brazil", "Ecuador", "Peru", "Uruguay", "Imports_avion", "Imports_barco"]})
+
+legacy_grouped_m1_2 = legacy_m1_order.groupby('country').agg({'real_weight':'sum'}).reset_index()
+
+mixtas_by_country = mixtas_m1_order.groupby('country').agg({
+    'order_id':'nunique',
+    'real_weight':'sum'}).reset_index().rename(
+    columns={'order_id':'ordenes_mixtas','real_weight':'real_weight_tot_mixta'})
+
+porcentage_mixtas = mixtas_by_country.merge(mixtas_df,'left','country')
+porcentage_mixtas['mixtas_legacy'] = round(porcentage_mixtas['ordenes_mixtas'].astype(float) * porcentage_mixtas['legacy'].astype(float),2)
+porcentage_mixtas['mixtas_real_weight'] = round(porcentage_mixtas['real_weight_tot_mixta'].astype(float) * porcentage_mixtas['legacy'].astype(float),2)
+porcentage_mixtas = porcentage_mixtas[['country','ordenes_mixtas','mixtas_legacy','mixtas_real_weight','real_weight_tot_mixta']]
+porcentage_mixtas = all_countries.merge(porcentage_mixtas, how='left', on='country').fillna(0)
+
+
+mask_ursec = legacy_m1_order[legacy_m1_order['ursec']==1]
+mask_ursec = mask_ursec.merge(merge_mixtas[['country','legacy']],'left','country')
+mask_ursec_grouped = mask_ursec.groupby(['country','mixta','legacy'])['order_id'].nunique().reset_index()
+
+legacy_ursec = mask_ursec_grouped[mask_ursec_grouped['mixta']=='legacy']
+
+mixta_ursec = mask_ursec_grouped[mask_ursec_grouped['mixta']=='mixta']
+mixta_ursec['order_id_mixta'] = round(mixta_ursec['order_id'].astype(float) * mixta_ursec['legacy'].astype(float),2)
+
+ursec_df = legacy_ursec.merge(mixta_ursec[['country','order_id_mixta']],'left','country').fillna(0)
+ursec_df['ursec'] = ursec_df['order_id'] + ursec_df['order_id_mixta']
+ursec_df = ursec_df[['country','ursec']]
+
+
+legacy_grouped_m1 = legacy_grouped_m1_1.merge(legacy_grouped_m1_2,'left','country').merge(
+    porcentage_mixtas,'left','country').merge(ursec_df,'left','country').merge(all_countries,'right','country').fillna(0)
+
+legacy_grouped_m1['order_id'] = legacy_grouped_m1['order_id'].astype(float) - legacy_grouped_m1['ordenes_mixtas'].astype(float) + legacy_grouped_m1['mixtas_legacy'].astype(float)
+
+legacy_grouped_m1['ebay'] = (legacy_grouped_m1['ebay'].astype(float) / legacy_grouped_m1['qty_ordered'].astype(float)*100).round(2).astype(str) + '%'
+
+legacy_grouped_m1['ursec'] = (legacy_grouped_m1['ursec'].astype(float) / legacy_grouped_m1['order_id'].astype(float)*100 ).round(2).astype(str) + '%'
+
+legacy_grouped_m1['real_weight'] = legacy_grouped_m1['real_weight'].astype(float) - legacy_grouped_m1['real_weight_tot_mixta'].astype(float) + legacy_grouped_m1['mixtas_real_weight'].astype(float)
+legacy_grouped_m1['real_weight'] = (legacy_grouped_m1['real_weight'].astype(float) / legacy_grouped_m1['order_id']).round(2)
+
+legacy_grouped_m1['weight'] = (legacy_grouped_m1['weight'].astype(float) / legacy_grouped_m1['order_id']).round(2)
+
+legacy_grouped_m1['avg_fob_sin_markup'] = (legacy_grouped_m1['po_price'].astype(float) / legacy_grouped_m1['order_id']).round(2)
+
+legacy_grouped_m1['avg_fob_markup'] = (legacy_grouped_m1['so_price'].astype(float) / legacy_grouped_m1['order_id'].astype(float)).round(2)
+
+legacy_grouped_m1.drop(columns={'po_price','so_price','ordenes_mixtas','mixtas_legacy','real_weight_tot_mixta','mixtas_real_weight'},inplace=True)
+legacy_grouped_m1 = legacy_grouped_m1[['country', 'order_id', 'qty_ordered', 'ebay', 'ursec', 'weight', 'real_weight',
+        'avg_fob_sin_markup', 'avg_fob_markup']]
+
+category_legacy = legacy_m1.groupby(['country','category_map']).agg({
+    'qty_ordered':'count'}).reset_index()
+
+category_legacy = category_legacy.pivot_table(index='country', columns='category_map', values='qty_ordered', aggfunc='sum', fill_value=0)
+
+all_categories = ['General', 'Clothing & Accessories', 'Electronics', 'Unknown',
+       'Home & Garden', 'Sports & Outdoors', 'Books']
+
+category_legacy_pivot = category_legacy.reindex(columns=all_categories, fill_value=0)
+
+category_legacy_pivot['all_category'] = category_legacy_pivot['General'] + category_legacy_pivot['Clothing & Accessories'] + category_legacy_pivot['Electronics'] + category_legacy_pivot['Unknown'] + category_legacy_pivot['Home & Garden']+category_legacy_pivot['Sports & Outdoors']+category_legacy_pivot['Books']
+category_legacy_pivot
+
+shipping_method_legacy =  legacy_m1.groupby(['country','shipping_method_clean'])['order_id'].nunique().reset_index()
+shipping_method_legacy = shipping_method_legacy.pivot_table(index='country', columns='shipping_method_clean', values='order_id', aggfunc='sum', fill_value=0)
+
+columns_to_drop = ['barco', 'avion']
+
+existing_columns = set(shipping_method_legacy.columns)
+columns_to_drop = [col for col in columns_to_drop if col in existing_columns]
+
+if columns_to_drop:
+    shipping_method_legacy.drop(columns=columns_to_drop, inplace=True)
+else:
+    print("Las columnas que intentas dropear no existen en el DataFrame.")
+    
+shipping_method_legacy['all_shipping'] = shipping_method_legacy['Envío normal a domicilio'] + shipping_method_legacy['Express Domicilio'] + shipping_method_legacy['Express Pick up'] + shipping_method_legacy['Pick up']
+shipping_method_legacy['Envío normal a domicilio'] = round(shipping_method_legacy['Envío normal a domicilio'] / shipping_method_legacy['all_shipping'] * 100,2).astype(str) + '%'
+shipping_method_legacy['Express Domicilio'] = round(shipping_method_legacy['Express Domicilio'] / shipping_method_legacy['all_shipping']* 100,2).astype(str) + '%'
+shipping_method_legacy['Express Pick up'] = round(shipping_method_legacy['Express Pick up'] / shipping_method_legacy['all_shipping']* 100,2).astype(str) + '%'
+shipping_method_legacy['Pick up'] = round(shipping_method_legacy['Pick up'] / shipping_method_legacy['all_shipping']* 100,2).astype(str) + '%'
+
+shipping_method_legacy.drop(columns={'all_shipping',''},inplace=True)
+
+legacy_bra = legacy_m1[legacy_m1['country']=='Brazil']
+
+cien_markup_bra = legacy_bra[legacy_bra['gmv_order']>=100].groupby('country').agg({'order_id':'nunique','gmv_order':'mean'}).reset_index().round(2).rename(
+    columns={'order_id':'orders >= 100 markup','gmv_order':'avg fob orders markup >100'})
+
+cien_sinmarkup_bra = legacy_bra.groupby(['country','order_id'])['po_price'].sum().reset_index()
+
+cien_sinmarkup_bra = cien_sinmarkup_bra[cien_sinmarkup_bra['po_price']>=100].groupby('country').agg({'order_id':'nunique','po_price':'mean'}).round(2).reset_index().rename(
+    columns={'order_id':'orders >= 100 sinmarkup','po_price':'avg fob orders sinmarkup >100'})
+
+cien_bra = cien_markup_bra.merge(cien_sinmarkup_bra,'left','country')
+
+peru_legacy = legacy_m1[legacy_m1['country']=='Peru']
+
+peru_markup_100 = peru_legacy[peru_legacy['gmv_order']>=200].groupby('country').agg({'order_id':'nunique','gmv_order':'mean'}).reset_index().round(2).rename(
+    columns={'order_id':'orders >= 200 markup','gmv_order':'avg fob orders markup >200'})
+
+cien_sinmarkup_peru = peru_legacy.groupby(['country','order_id'])['po_price'].sum().reset_index()
+
+cien_sinmarkup_peru = cien_sinmarkup_peru[cien_sinmarkup_peru['po_price']>=200].groupby('country').agg({'order_id':'nunique','po_price':'mean'}).reset_index().round(2).reset_index().rename(
+    columns={'order_id':'orders >= 200 sinmarkup','po_price':'avg fob orders sinmarkup >200'})
+
+dos_peru = peru_markup_100.merge(cien_sinmarkup_peru,'left','country')
+
+dos_peru.drop(columns={'index'},inplace=True)
+
+
+coar_region = legacy_m1[legacy_m1['country']=='Arg Coar'].groupby(['country','region'])['order_id'].nunique().reset_index()
+arg_region = legacy_m1[legacy_m1['country']=='Argentina'].groupby(['country','region'])['order_id'].nunique().reset_index()
+
+coar_region = coar_region.pivot_table(index='country', columns='region', values='order_id', aggfunc='sum', fill_value=0)
+arg_region = arg_region.pivot_table(index='country', columns='region', values='order_id', aggfunc='sum', fill_value=0)
+
+coar_region.rename(columns={'CABA':'CABA CoAr', 'Interior':'Interior CoAr'},inplace=True)
+arg_region.rename(columns={'CABA':'CABA Arg', 'Interior':'Interior Arg'},inplace=True)
+
+coar_region['CABA CoAr'] = 0
+arg_region['CABA Arg'] = 0
+
+region_arg = pd.concat([coar_region,arg_region])
+
+region_arg.fillna(0,inplace=True)
+region_arg['all_region'] = region_arg['CABA CoAr'] + region_arg['Interior CoAr']+ region_arg['CABA Arg'] +region_arg['Interior Arg']
+region_arg['CABA CoAr'] = (region_arg['CABA CoAr']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['Interior CoAr'] = (region_arg['Interior CoAr']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['CABA Arg'] = (region_arg['CABA Arg']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['Interior Arg'] = (region_arg['Interior Arg']/region_arg['all_region']*100).round(2).astype(str) + '%'
+
+region_arg.drop(columns={'all_region'},inplace=True)
+
+uy_order_items = legacy_m1[legacy_m1['country']=='Uruguay'].groupby(['country','order_id'])['qty_ordered'].sum().reset_index()
+
+items = [1, 2]
+items_1_2 = uy_order_items[uy_order_items['qty_ordered'].isin(items)].groupby(['country','qty_ordered'])['order_id'].nunique().reset_index().rename(columns={'order_id':'Quantity of Orders'})
+
+items_3 = uy_order_items[uy_order_items['qty_ordered']>=3].groupby(['country','qty_ordered'])['order_id'].nunique().reset_index().rename(columns={'order_id':'Quantity of Orders'})
+items_3 = items_3.groupby('country')['Quantity of Orders'].sum().reset_index()
+
+items_uru = pd.concat([items_1_2,items_3])
+items_uru['qty_ordered'].fillna(3,inplace=True)
+
+items_uru = items_uru.pivot_table(index='country', columns='qty_ordered', values='Quantity of Orders', aggfunc='sum', fill_value=0)
+
+items_uru['total'] = items_uru[1] + items_uru[2] + items_uru[3]
+items_uru[1] = round(items_uru[1] / items_uru['total']*100,2).astype(str) + '%'
+items_uru[2] = round(items_uru[2] / items_uru['total']*100,2).astype(str) + '%'
+items_uru[3] = round(items_uru[3] / items_uru['total']*100,2).astype(str) + '%'
+items_uru.drop(columns={'total'},inplace=True)
+
+merge_legacy = legacy_grouped_m1.merge(shipping_method_legacy,'left','country').merge(cien_bra,'left','country').merge(dos_peru,'left','country').merge(region_arg,'left','country').merge(items_uru,'left','country').merge(category_legacy_pivot,'left','country')
+
+merge_legacy['General'] = (merge_legacy['General']/merge_legacy['all_category']*100).round(2).astype(str) + '%'
+merge_legacy['Books'] = (merge_legacy['Books']/merge_legacy['all_category']*100).round(2).astype(str) + '%'
+merge_legacy['Clothing & Accessories'] = (merge_legacy['Clothing & Accessories']/merge_legacy['all_category']*100).round(2).astype(str) + '%'
+merge_legacy['Electronics'] = (merge_legacy['Electronics']/merge_legacy['all_category']*100).round(2).astype(str) + '%'
+merge_legacy['Home & Garden'] = (merge_legacy['Home & Garden']/merge_legacy['all_category']*100).round(2).astype(str) + '%'
+merge_legacy['Sports & Outdoors'] = (merge_legacy['Sports & Outdoors']/merge_legacy['all_category']*100).round(2).astype(str) + '%'
+merge_legacy['Unknown'] = (merge_legacy['Unknown']/merge_legacy['all_category']*100).round(2).astype(str) + '%'
+
+merge_legacy.drop(columns={'all_category'},inplace=True)
+
+argentina_legacy = merge_legacy.loc[merge_legacy['country'] == 'Argentina'].drop(columns={'ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup','avg fob orders sinmarkup >100','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','avg fob orders sinmarkup >200',1.0000,2.0000,3,'CABA CoAr','Interior CoAr'})
+melted_argentina_legacy  = argentina_legacy.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_argentina_legacy.drop(columns={'country'},inplace=True)
+
+Coar_legacy = merge_legacy.loc[merge_legacy['country'] == 'Arg Coar'].drop(columns={'ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup','avg fob orders sinmarkup >100','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','avg fob orders sinmarkup >200',1.0000,2.0000,3,'CABA Arg','Interior Arg'})
+melted_Coar_legacy = Coar_legacy.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_Coar_legacy.drop(columns={'country'},inplace=True)
+
+brazil_legacy = merge_legacy.loc[merge_legacy['country'] == 'Brazil'].drop(columns={'ursec',1.0000,2.0000,3,'CABA Arg','Interior Arg','CABA CoAr','Interior CoAr','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','avg fob orders sinmarkup >200'})
+melted_brazil_legacy = brazil_legacy.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_brazil_legacy.drop(columns={'country'},inplace=True)
+
+ecuador_legacy = merge_legacy.loc[merge_legacy['country'] == 'Ecuador'].drop(columns={'ursec',1.0000,2.0000,3,'CABA Arg','Interior Arg','CABA CoAr','Interior CoAr','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup','avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders sinmarkup >200'})
+melted_ecuador_legacy = ecuador_legacy.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_ecuador_legacy.drop(columns={'country'},inplace=True)
+
+imports_legacy = merge_legacy.loc[(merge_legacy['country'] == 'Imports_avion')|(merge_legacy['country'] == 'Imports_barco')].drop(columns={'orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders markup >200','orders >= 200 sinmarkup', 'avg fob orders sinmarkup >200','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg',1.0000,2.0000,3,'Envío normal a domicilio','Express Domicilio','Express Pick up','Pick up'})                                                                                                                                       
+melted_imports_legacy = imports_legacy.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_imports_legacy.drop(columns={'country'},inplace=True)
+
+peru_legacy = merge_legacy.loc[merge_legacy['country'] == 'Peru'].drop(columns={'ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg',1.0000,2.0000,3})                                                                                               
+melted_peru_legacy = peru_legacy.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_peru_legacy.drop(columns={'country'},inplace=True)
+
+uruguay_legacy = merge_legacy.loc[merge_legacy['country'] == 'Uruguay'].drop(columns={'orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders markup >200','orders >= 200 sinmarkup', 'avg fob orders sinmarkup >200','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg'})                                                                                            
+melted_uruguay_legacy = uruguay_legacy.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_uruguay_legacy.drop(columns={'country'},inplace=True)
+
+
+tab = sh.worksheet('Arg Coar')
+melted_Coar_legacy.iloc[:, 1] = melted_Coar_legacy.iloc[:, 1].astype(str)
+num_rows, num_cols = melted_Coar_legacy.shape
+column_values = melted_Coar_legacy.iloc[:, 1].tolist()
+tab.update(cell_range, [[value] for value in column_values])
+
+tab = sh.worksheet('Arg CoPriv')
+melted_argentina_legacy.iloc[:, 1] = melted_argentina_legacy.iloc[:, 1].astype(str)
+num_rows, num_cols = melted_argentina_legacy.shape
+column_values = melted_argentina_legacy.iloc[:, 1].tolist()
+tab.update(cell_range, [[value] for value in column_values])
+
+tab = sh.worksheet('Imp')
+melted_imports_legacy.iloc[:, 1] = melted_imports_legacy.iloc[:, 1].astype(str)
+num_rows, num_cols = melted_imports_legacy.shape
+column_values = melted_imports_legacy.iloc[:, 1].tolist()
+tab.update(cell_range, [[value] for value in column_values])
+
+tab = sh.worksheet('Uy')
+melted_uruguay_legacy.iloc[:, 1] = melted_uruguay_legacy.iloc[:, 1].astype(str)
+num_rows, num_cols = melted_uruguay_legacy.shape
+column_values = melted_uruguay_legacy.iloc[:, 1].tolist()
+tab.update(cell_range, [[value] for value in column_values])
+
+tab = sh.worksheet('Bra')
+melted_brazil_legacy.iloc[:, 1] = melted_brazil_legacy.iloc[:, 1].astype(str)
+num_rows, num_cols = melted_brazil_legacy.shape
+column_values = melted_brazil_legacy.iloc[:, 1].tolist()
+tab.update(cell_range, [[value] for value in column_values])
+
+tab = sh.worksheet('Peru')
+melted_peru_legacy.iloc[:, 1] = melted_peru_legacy.iloc[:, 1].astype(str)
+num_rows, num_cols = melted_peru_legacy.shape
+column_values = melted_peru_legacy.iloc[:, 1].tolist()
+tab.update(cell_range, [[value] for value in column_values])
+
+tab = sh.worksheet('Ecu')
+melted_ecuador_legacy.iloc[:, 1] = melted_ecuador_legacy.iloc[:, 1].astype(str)
+num_rows, num_cols = melted_ecuador_legacy.shape
+column_values = melted_ecuador_legacy.iloc[:, 1].tolist()
+tab.update(cell_range, [[value] for value in column_values])
+
+mkt_m1_ch[['qty_ordered','ursec']] = mkt_m1_ch[['qty_ordered','ursec']].astype(float)
+
+mkt_grouped_m1_1 = mkt_m1_ch.groupby(['country']).agg({
+    'order_id':'nunique',
+    'qty_ordered':'sum',
+    'ebay':'sum',
+    'weight':'sum',
+    'po_price':'sum',
+    'so_price':'sum'}).reset_index()
+
+all_countries = pd.DataFrame({'country': ["Arg Coar", "Argentina", "Brazil", "Ecuador", "Peru", "Uruguay", "Imports"]})
+
+mkt_grouped_m1_1 = all_countries.merge(mkt_grouped_m1_1, how='left', on='country').fillna(0)
+
+
+mixtas_by_country = mkt_m1_order_ch[mkt_m1_order_ch['mixta']=='mixta'].groupby('country').agg(
+    {'order_id':'nunique'
+     ,'real_weight':'sum'}).reset_index().rename(columns={'order_id':'ordenes_mixtas','real_weight':'real_weight_tot_mixta'})
+
+
+porcentage_mixtas = mixtas_by_country.merge(mixtas_df,'left','country')
+porcentage_mixtas['mixtas_mkt'] = round(porcentage_mixtas['ordenes_mixtas'] * porcentage_mixtas['mkt'],2)
+porcentage_mixtas['mixtas_real_weight'] = round(porcentage_mixtas['real_weight_tot_mixta'].astype(float) * porcentage_mixtas['mkt'],2)
+porcentage_mixtas = porcentage_mixtas[['country','ordenes_mixtas','mixtas_mkt','real_weight_tot_mixta','mixtas_real_weight']]
+porcentage_mixtas = all_countries.merge(porcentage_mixtas, how='left', on='country').fillna(0)
+
+
+mkt_grouped_m1_2 = mkt_m1_order_ch.groupby(['country']).agg({'real_weight':'sum','ursec':'sum'}).reset_index()
+
+mkt_grouped_m1 = mkt_grouped_m1_1.merge(mkt_grouped_m1_2,'left','country').merge(porcentage_mixtas,'left','country').fillna(0)
+
+mkt_grouped_m1['order_id'] = mkt_grouped_m1['order_id'] - mkt_grouped_m1['ordenes_mixtas'] + mkt_grouped_m1['mixtas_mkt']
+mkt_grouped_m1['real_weight'] = mkt_grouped_m1['real_weight'].astype(float) - mkt_grouped_m1['real_weight_tot_mixta'].astype(float) + mkt_grouped_m1['mixtas_real_weight'].astype(float)
+mkt_grouped_m1['real_weight'] = (mkt_grouped_m1['real_weight'].astype(float) / mkt_grouped_m1['order_id']).round(2)
+mkt_grouped_m1['weight'] = (mkt_grouped_m1['weight'].astype(float) / mkt_grouped_m1['order_id']).round(2)
+mkt_grouped_m1['avg_fob_sin_markup'] = (mkt_grouped_m1['po_price'].astype(float) / mkt_grouped_m1['order_id']).round(2)
+mkt_grouped_m1['avg_fob_markup'] = (mkt_grouped_m1['so_price'].astype(float) / mkt_grouped_m1['order_id']).round(2)
+
+mkt_grouped_m1.drop(columns={'po_price','so_price','ordenes_mixtas','mixtas_mkt','real_weight_tot_mixta','mixtas_real_weight'},inplace=True)
+
+
+#######################################################################################################################
+
+##CATEGORY ##
+
+category_mkt = mkt_m1_ch.groupby(['country','category_map']).agg({
+    'qty_ordered':'count'}).reset_index()
+
+category_mkt = category_mkt.pivot_table(index='country', columns='category_map', values='qty_ordered', aggfunc='sum', fill_value=0)
+
+all_categories = ['General', 'Clothing & Accessories', 'Electronics', 'Unknown',
+       'Home & Garden', 'Sports & Outdoors', 'Books']
+
+category_mkt_pivot = category_mkt.reindex(columns=all_categories, fill_value=0)
+
+category_mkt_pivot['all_category'] = category_mkt_pivot['General'] + category_mkt_pivot['Clothing & Accessories'] + category_mkt_pivot['Electronics'] + category_mkt_pivot['Unknown'] + category_mkt_pivot['Home & Garden']+category_mkt_pivot['Sports & Outdoors']+category_mkt_pivot['Books']
+
+#######################################################################################################################
+
+## SHIPPING ##
+
+shipping_method_mkt =  mkt_m1_ch.groupby(['country','shipping_method_clean'])['order_id'].nunique().reset_index()
+shipping_method_mkt = shipping_method_mkt.pivot_table(index='country', columns='shipping_method_clean', values='order_id', aggfunc='sum', fill_value=0)
+
+all_shipping = ['Envío normal a domicilio','Express Domicilio','Express Pick up','Pick up']
+
+shipping_method_mkt = shipping_method_mkt.reindex(columns=all_shipping, fill_value=0)
+
+shipping_method_mkt['all_shipping_tot'] = shipping_method_mkt['Envío normal a domicilio'] + shipping_method_mkt['Express Domicilio'] + shipping_method_mkt['Express Pick up']  + shipping_method_mkt['Pick up']
+shipping_method_mkt['Envío normal a domicilio'] = round(shipping_method_mkt['Envío normal a domicilio'] / shipping_method_mkt['all_shipping_tot'] * 100,2).astype(str) + '%'
+shipping_method_mkt['Express Domicilio'] = round(shipping_method_mkt['Express Domicilio'] / shipping_method_mkt['all_shipping_tot']* 100,2).astype(str) + '%'
+shipping_method_mkt['Express Pick up'] = round(shipping_method_mkt['Express Pick up'] / shipping_method_mkt['all_shipping_tot']* 100,2).astype(str) + '%'
+shipping_method_mkt['Pick up'] = round(shipping_method_mkt['Pick up'] / shipping_method_mkt['all_shipping_tot']* 100,2).astype(str) + '%'
+
+shipping_method_mkt.drop(columns={'all_shipping_tot'},inplace=True)
+
+#######################################################################################################################
+
+## BRA
+
+mkt_bra = mkt_m1_ch[mkt_m1_ch['country']=='Brazil']
+
+cien_markup_bra = mkt_bra[mkt_bra['gmv_order']>=100].groupby('country').agg({'order_id':'nunique','gmv_order':'mean'}).reset_index().round(2).rename(
+    columns={'order_id':'orders >= 100 markup','gmv_order':'avg fob orders markup >100'})
+
+cien_sinmarkup_bra = mkt_bra.groupby(['country','order_id'])['po_price'].sum().reset_index()
+
+cien_sinmarkup_bra = cien_sinmarkup_bra[cien_sinmarkup_bra['po_price']>=100].groupby('country').agg({'order_id':'nunique','po_price':'mean'}).round(2).reset_index().rename(
+    columns={'order_id':'orders >= 100 sinmarkup','po_price':'avg fob orders sinmarkup >100'})
+
+cien_bra = cien_markup_bra.merge(cien_sinmarkup_bra,'left','country')
+
+#######################################################################################################################
+
+## PERU 
+
+peru_mkt = mkt_m1_ch[mkt_m1_ch['country']=='Peru']
+
+peru_markup_100 = peru_mkt[peru_mkt['gmv_order']>=200].groupby('country').agg({'order_id':'nunique','gmv_order':'mean'}).reset_index().round(2).rename(
+    columns={'order_id':'orders >= 200 markup','gmv_order':'avg fob orders markup >200'})
+
+cien_sinmarkup_peru = peru_mkt.groupby(['country','order_id'])['po_price'].sum().reset_index()
+
+cien_sinmarkup_peru = cien_sinmarkup_peru[cien_sinmarkup_peru['po_price']>=200].groupby('country').agg({'order_id':'nunique','po_price':'mean'}).reset_index().round(2).reset_index().rename(
+    columns={'order_id':'orders >= 200 sinmarkup','po_price':'avg fob orders sinmarkup >200'})
+
+dos_peru = peru_markup_100.merge(cien_sinmarkup_peru,'left','country')
+
+dos_peru.drop(columns={'index'},inplace=True)
+
+
+#######################################################################################################################
+
+## ARGENTINA
+
+coar_region = mkt_m1_ch[mkt_m1_ch['country']=='Arg Coar'].groupby(['country','region'])['order_id'].nunique().reset_index()
+arg_region = mkt_m1_ch[mkt_m1_ch['country']=='Argentina'].groupby(['country','region'])['order_id'].nunique().reset_index()
+
+coar_region = coar_region.pivot_table(index='country', columns='region', values='order_id', aggfunc='sum', fill_value=0)
+arg_region = arg_region.pivot_table(index='country', columns='region', values='order_id', aggfunc='sum', fill_value=0)
+
+all_region = ['Interior','CABA']
+coar_region = coar_region.reindex(columns=all_region, fill_value=0)
+arg_region = arg_region.reindex(columns=all_region, fill_value=0)
+
+coar_region.rename(columns={'CABA':'CABA CoAr', 'Interior':'Interior CoAr'},inplace=True)
+arg_region.rename(columns={'CABA':'CABA Arg', 'Interior':'Interior Arg'},inplace=True)
+
+region_arg = pd.concat([coar_region,arg_region])
+
+region_arg.fillna(0,inplace=True)
+region_arg['all_region'] = region_arg['CABA CoAr'] + region_arg['Interior CoAr']+ region_arg['CABA Arg'] +region_arg['Interior Arg']
+region_arg['CABA CoAr'] = (region_arg['CABA CoAr']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['Interior CoAr'] = (region_arg['Interior CoAr']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['CABA Arg'] = (region_arg['CABA Arg']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['Interior Arg'] = (region_arg['Interior Arg']/region_arg['all_region']*100).round(2).astype(str) + '%'
+
+region_arg.drop(columns={'all_region'},inplace=True)
+#######################################################################################################################
+
+## URUGUAY
+
+uy_order_items = mkt_m1_ch[mkt_m1_ch['country']=='Uruguay'].groupby(['country','order_id'])['qty_ordered'].sum().reset_index()
+
+items = [1, 2]
+items_1_2 = uy_order_items[uy_order_items['qty_ordered'].isin(items)].groupby(['country','qty_ordered'])['order_id'].nunique().reset_index().rename(columns={'order_id':'Quantity of Orders'})
+
+items_3 = uy_order_items[uy_order_items['qty_ordered']>=3].groupby(['country','qty_ordered'])['order_id'].nunique().reset_index().rename(columns={'order_id':'Quantity of Orders'})
+items_3 = items_3.groupby('country')['Quantity of Orders'].sum().reset_index()
+
+items_uru = pd.concat([items_1_2,items_3])
+items_uru['qty_ordered'].fillna(3,inplace=True)
+
+items_uru = items_uru.pivot_table(index='country', columns='qty_ordered', values='Quantity of Orders', aggfunc='sum', fill_value=0)
+
+all_items = [1,2,3]
+items_uru = items_uru.reindex(columns=all_items, fill_value=0)
+
+items_uru['total'] = items_uru[1] + items_uru[2] + items_uru[3]
+items_uru[1] = round(items_uru[1] / items_uru['total']*100,2).astype(str) + '%'
+items_uru[2] = round(items_uru[2] / items_uru['total']*100,2).astype(str) + '%'
+items_uru[3] = round(items_uru[3] / items_uru['total']*100,2).astype(str) + '%'
+items_uru.drop(columns={'total'},inplace=True)
+
+#######################################################################################################################
+
+### final merge and melt
+
+merge_mkt = mkt_grouped_m1.merge(shipping_method_mkt,'left','country').merge(cien_bra,'left','country').merge(dos_peru,'left','country').merge(region_arg,'left','country').merge(items_uru,'left','country').merge(category_mkt_pivot,'left','country')
+
+merge_mkt['General'] = (merge_mkt['General']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Books'] = (merge_mkt['Books']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Unknown'] = (merge_mkt['Unknown']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Clothing & Accessories'] = (merge_mkt['Clothing & Accessories']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Electronics'] = (merge_mkt['Electronics']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Home & Garden'] = (merge_mkt['Home & Garden']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Sports & Outdoors'] = (merge_mkt['Sports & Outdoors']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+
+merge_mkt.drop(columns={'all_category'},inplace=True)
+
+#######################################################################################################################
+
+argentina_mkt = merge_mkt.loc[merge_mkt['country'] == 'Argentina'].drop(columns={'ebay','ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup','avg fob orders sinmarkup >100','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','avg fob orders sinmarkup >200',1.0000,2.0000,3,'CABA CoAr','Interior CoAr','ebay'})
+melted_argentina_mkt = argentina_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_argentina_mkt.drop(columns={'country'},inplace=True)
+
+Coar_mkt = merge_mkt.loc[merge_mkt['country'] == 'Arg Coar'].drop(columns={'ebay','ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders markup >200','orders >= 200 sinmarkup', 'avg fob orders sinmarkup >200','CABA Arg','Interior Arg',1.0000,2.0000,3,'ebay'})
+melted_Coar_mkt = Coar_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_Coar_mkt.drop(columns={'country'},inplace=True)
+
+brazil_mkt = merge_mkt.loc[merge_mkt['country'] == 'Brazil'].drop(columns={'ebay','ursec',1.0000,2.0000,3,'CABA Arg','Interior Arg','CABA CoAr','Interior CoAr','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','avg fob orders sinmarkup >200'})
+melted_brazil_mkt = brazil_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_brazil_mkt.drop(columns={'country'},inplace=True)
+
+ecuador_mkt = merge_mkt.loc[merge_mkt['country'] == 'Ecuador'].drop(columns={'ebay','ursec',1.0000,2.0000,3,'CABA Arg','Interior Arg','CABA CoAr','Interior CoAr','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup','avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders sinmarkup >200'})
+melted_ecuador_mkt = ecuador_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_ecuador_mkt.drop(columns={'country'},inplace=True)
+
+imports_mkt = merge_mkt.loc[(merge_mkt['country'] == 'Imports_avion')|(merge_mkt['country'] == 'Imports_barco')].drop(columns={'ebay','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders markup >200','orders >= 200 sinmarkup', 'avg fob orders sinmarkup >200','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg',1.0000,2.0000,3,})                                                                                                                                          
+melted_imports_mkt = imports_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_imports_mkt.drop(columns={'country'},inplace=True)
+
+peru_mkt = merge_mkt.loc[merge_mkt['country'] == 'Peru'].drop(columns={'ebay','ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg',1.0000,2.0000,3})                                                                                              
+melted_peru_mkt = peru_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_peru_mkt.drop(columns={'country'},inplace=True)
+
+uruguay_mkt = merge_mkt.loc[merge_mkt['country'] == 'Uruguay'].drop(columns={'ebay','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders markup >200','orders >= 200 sinmarkup', 'avg fob orders sinmarkup >200','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg'})                                                                                                          
+melted_uruguay_mkt = uruguay_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_uruguay_mkt.drop(columns={'country'},inplace=True)
+
+
+ab = sh.worksheet('Arg Coar')
+column_values = melted_Coar_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 26
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Arg CoPriv')
+column_values = melted_argentina_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 26
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Imp')
+column_values = melted_imports_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 36
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Uy')
+column_values = melted_uruguay_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 29
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Bra')
+column_values = melted_brazil_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 28
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Peru')
+column_values = melted_peru_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 28
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Ecu')
+column_values = melted_ecuador_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 24
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+mkt_m1_mia[['qty_ordered','ursec']] = mkt_m1_mia[['qty_ordered','ursec']].astype(float)
+
+mkt_grouped_m1_1 = mkt_m1_mia.groupby(['country']).agg({
+    'order_id':'nunique',
+    'qty_ordered':'sum',
+    'weight':'sum',
+    'po_price':'sum',
+    'so_price':'sum'}).reset_index()
+
+all_countries = pd.DataFrame({'country': ["Arg Coar", "Argentina", "Brazil", "Ecuador", "Peru", "Uruguay", "Imports"]})
+
+mkt_grouped_m1_1 = all_countries.merge(mkt_grouped_m1_1, how='left', on='country').fillna(0)
+
+
+mixtas_by_country = mkt_m1_order_mia[mkt_m1_order_mia['mixta']=='mixta'].groupby('country').agg({
+    'order_id':'nunique'
+    ,'real_weight':'sum'}).reset_index().rename(columns={'order_id':'ordenes_mixtas','real_weight':'real_weight_tot_mixta'})
+
+
+porcentage_mixtas = mixtas_by_country.merge(mixtas_df,'left','country')
+porcentage_mixtas['mixtas_mkt'] = round(porcentage_mixtas['ordenes_mixtas'].astype(float) * porcentage_mixtas['mkt'].astype(float),2)
+porcentage_mixtas['mixtas_real_weight'] = round(porcentage_mixtas['real_weight_tot_mixta'].astype(float) * porcentage_mixtas['mkt'],2)
+porcentage_mixtas = porcentage_mixtas[['country','ordenes_mixtas','mixtas_mkt','real_weight_tot_mixta','mixtas_real_weight']]
+porcentage_mixtas = all_countries.merge(porcentage_mixtas, how='left', on='country').fillna(0)
+
+
+mkt_grouped_m1_2 = mkt_m1_order_mia.groupby(['country']).agg({'real_weight':'sum','ursec':'sum'}).reset_index()
+
+
+mkt_grouped_m1 = mkt_grouped_m1_1.merge(mkt_grouped_m1_2,'left','country').merge(porcentage_mixtas,'left','country').fillna(0)
+
+
+mkt_grouped_m1['order_id'] = mkt_grouped_m1['order_id'] - mkt_grouped_m1['ordenes_mixtas'].astype(float) + mkt_grouped_m1['mixtas_mkt']
+mkt_grouped_m1['real_weight'] = mkt_grouped_m1['real_weight'].astype(float) - mkt_grouped_m1['real_weight_tot_mixta'].astype(float) + mkt_grouped_m1['mixtas_real_weight'].astype(float)
+mkt_grouped_m1['real_weight'] = (mkt_grouped_m1['real_weight'].astype(float) / mkt_grouped_m1['order_id']).round(2)
+mkt_grouped_m1['weight'] = (mkt_grouped_m1['weight'].astype(float) / mkt_grouped_m1['order_id']).round(2)
+mkt_grouped_m1['avg_fob_sin_markup'] = (mkt_grouped_m1['po_price'].astype(float) / mkt_grouped_m1['order_id']).round(2)
+mkt_grouped_m1['avg_fob_markup'] = (mkt_grouped_m1['so_price'].astype(float) / mkt_grouped_m1['order_id']).round(2)
+
+mkt_grouped_m1.drop(columns={'po_price','so_price','ordenes_mixtas','mixtas_mkt','real_weight_tot_mixta','mixtas_real_weight'},inplace=True)
+
+#######################################################################################################################
+
+##CATEGORY ##
+
+category_mkt = mkt_m1_mia.groupby(['country','category_map']).agg({
+    'qty_ordered':'count'}).reset_index()
+
+category_mkt = category_mkt.pivot_table(index='country', columns='category_map', values='qty_ordered', aggfunc='sum', fill_value=0)
+
+all_categories = ['General', 'Clothing & Accessories', 'Electronics', 'Unknown',
+       'Home & Garden', 'Sports & Outdoors', 'Books']
+
+category_mkt_pivot = category_mkt.reindex(columns=all_categories, fill_value=0)
+
+category_mkt_pivot['all_category'] = category_mkt_pivot['General'] + category_mkt_pivot['Clothing & Accessories'] + category_mkt_pivot['Electronics'] + category_mkt_pivot['Unknown'] + category_mkt_pivot['Home & Garden']+category_mkt_pivot['Sports & Outdoors']+category_mkt_pivot['Books']
+
+#######################################################################################################################
+
+## SHIPPING ##
+
+shipping_method_mkt =  mkt_m1_mia.groupby(['country','shipping_method_clean'])['order_id'].nunique().reset_index()
+shipping_method_mkt = shipping_method_mkt.pivot_table(index='country', columns='shipping_method_clean', values='order_id', aggfunc='sum', fill_value=0)
+
+all_shipping = ['Envío normal a domicilio','Express Domicilio','Express Pick up','Pick up']
+
+shipping_method_mkt = shipping_method_mkt.reindex(columns=all_shipping, fill_value=0)
+
+shipping_method_mkt['all_shipping_tot'] = shipping_method_mkt['Envío normal a domicilio'] + shipping_method_mkt['Express Domicilio'] + shipping_method_mkt['Express Pick up']  + shipping_method_mkt['Pick up']
+shipping_method_mkt['Envío normal a domicilio'] = round(shipping_method_mkt['Envío normal a domicilio'] / shipping_method_mkt['all_shipping_tot'] * 100,2).astype(str) + '%'
+shipping_method_mkt['Express Domicilio'] = round(shipping_method_mkt['Express Domicilio'] / shipping_method_mkt['all_shipping_tot']* 100,2).astype(str) + '%'
+shipping_method_mkt['Express Pick up'] = round(shipping_method_mkt['Express Pick up'] / shipping_method_mkt['all_shipping_tot']* 100,2).astype(str) + '%'
+shipping_method_mkt['Pick up'] = round(shipping_method_mkt['Pick up'] / shipping_method_mkt['all_shipping_tot']* 100,2).astype(str) + '%'
+
+shipping_method_mkt.drop(columns={'all_shipping_tot'},inplace=True)
+#######################################################################################################################
+
+## BRA
+
+mkt_bra = mkt_m1_mia[mkt_m1_mia['country']=='Brazil']
+
+cien_markup_bra = mkt_bra[mkt_bra['gmv_order']>=100].groupby('country').agg({'order_id':'nunique','gmv_order':'mean'}).reset_index().round(2).rename(
+    columns={'order_id':'orders >= 100 markup','gmv_order':'avg fob orders markup >100'})
+
+cien_sinmarkup_bra = mkt_bra.groupby(['country','order_id'])['po_price'].sum().reset_index()
+
+cien_sinmarkup_bra = cien_sinmarkup_bra[cien_sinmarkup_bra['po_price']>=100].groupby('country').agg({'order_id':'nunique','po_price':'mean'}).round(2).reset_index().rename(
+    columns={'order_id':'orders >= 100 sinmarkup','po_price':'avg fob orders sinmarkup >100'})
+
+cien_bra = cien_markup_bra.merge(cien_sinmarkup_bra,'left','country')
+
+#######################################################################################################################
+
+## PERU 
+
+peru_mkt = mkt_m1_mia[mkt_m1_mia['country']=='Peru']
+
+peru_markup_100 = peru_mkt[peru_mkt['gmv_order']>=200].groupby('country').agg({'order_id':'nunique','gmv_order':'mean'}).reset_index().round(2).rename(
+    columns={'order_id':'orders >= 200 markup','gmv_order':'avg fob orders markup >200'})
+
+cien_sinmarkup_peru = peru_mkt.groupby(['country','order_id'])['po_price'].sum().reset_index()
+
+cien_sinmarkup_peru = cien_sinmarkup_peru[cien_sinmarkup_peru['po_price']>=200].groupby('country').agg({'order_id':'nunique','po_price':'mean'}).reset_index().round(2).reset_index().rename(
+    columns={'order_id':'orders >= 200 sinmarkup','po_price':'avg fob orders sinmarkup >200'})
+
+dos_peru = peru_markup_100.merge(cien_sinmarkup_peru,'left','country')
+
+dos_peru.drop(columns={'index'},inplace=True)
+
+
+#######################################################################################################################
+
+## ARGENTINA
+
+coar_region = mkt_m1_mia[mkt_m1_mia['country']=='Arg Coar'].groupby(['country','region'])['order_id'].nunique().reset_index()
+arg_region = mkt_m1_mia[mkt_m1_mia['country']=='Argentina'].groupby(['country','region'])['order_id'].nunique().reset_index()
+
+coar_region = coar_region.pivot_table(index='country', columns='region', values='order_id', aggfunc='sum', fill_value=0)
+arg_region = arg_region.pivot_table(index='country', columns='region', values='order_id', aggfunc='sum', fill_value=0)
+
+all_region = ['Interior','CABA']
+coar_region = coar_region.reindex(columns=all_region, fill_value=0)
+arg_region = arg_region.reindex(columns=all_region, fill_value=0)
+
+coar_region.rename(columns={'CABA':'CABA CoAr', 'Interior':'Interior CoAr'},inplace=True)
+arg_region.rename(columns={'CABA':'CABA Arg', 'Interior':'Interior Arg'},inplace=True)
+
+region_arg = pd.concat([coar_region,arg_region])
+
+region_arg.fillna(0,inplace=True)
+region_arg['all_region'] = region_arg['CABA CoAr'] + region_arg['Interior CoAr']+ region_arg['CABA Arg'] +region_arg['Interior Arg']
+region_arg['CABA CoAr'] = (region_arg['CABA CoAr']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['Interior CoAr'] = (region_arg['Interior CoAr']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['CABA Arg'] = (region_arg['CABA Arg']/region_arg['all_region']*100).round(2).astype(str) + '%'
+region_arg['Interior Arg'] = (region_arg['Interior Arg']/region_arg['all_region']*100).round(2).astype(str) + '%'
+
+region_arg.drop(columns={'all_region'},inplace=True)
+#######################################################################################################################
+
+## URUGUAY
+
+uy_order_items = mkt_m1_mia[mkt_m1_mia['country']=='Uruguay'].groupby(['country','order_id'])['qty_ordered'].sum().reset_index()
+
+items = [1, 2]
+items_1_2 = uy_order_items[uy_order_items['qty_ordered'].isin(items)].groupby(['country','qty_ordered'])['order_id'].nunique().reset_index().rename(columns={'order_id':'Quantity of Orders'})
+
+items_3 = uy_order_items[uy_order_items['qty_ordered']>=3].groupby(['country','qty_ordered'])['order_id'].nunique().reset_index().rename(columns={'order_id':'Quantity of Orders'})
+items_3 = items_3.groupby('country')['Quantity of Orders'].sum().reset_index()
+
+items_uru = pd.concat([items_1_2,items_3])
+items_uru['qty_ordered'].fillna(3,inplace=True)
+
+items_uru = items_uru.pivot_table(index='country', columns='qty_ordered', values='Quantity of Orders', aggfunc='sum', fill_value=0)
+
+all_items = [1,2,3]
+items_uru = items_uru.reindex(columns=all_items, fill_value=0)
+
+items_uru['total'] = items_uru[1] + items_uru[2] + items_uru[3]
+#items_uru[1] = round(items_uru[1] / items_uru['total']*100,2).astype(str) + '%'
+#items_uru[2] = round(items_uru[2] / items_uru['total']*100,2).astype(str) + '%'
+#items_uru[3] = round(items_uru[3] / items_uru['total']*100,2).astype(str) + '%'
+#items_uru.drop(columns={'total'},inplace=True)
+
+merge_mkt = mkt_grouped_m1.merge(shipping_method_mkt,'left','country').merge(cien_bra,'left','country').merge(dos_peru,'left','country').merge(region_arg,'left','country').merge(items_uru,'left','country').merge(category_mkt_pivot,'left','country')
+
+merge_mkt['General'] = (merge_mkt['General']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Books'] = (merge_mkt['Books']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Unknown'] = (merge_mkt['Unknown']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Clothing & Accessories'] = (merge_mkt['Clothing & Accessories']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Electronics'] = (merge_mkt['Electronics']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Home & Garden'] = (merge_mkt['Home & Garden']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+merge_mkt['Sports & Outdoors'] = (merge_mkt['Sports & Outdoors']/merge_mkt['all_category']*100).round(2).astype(str) + '%'
+
+merge_mkt.drop(columns={'all_category'},inplace=True)
+argentina_mkt = merge_mkt.loc[merge_mkt['country'] == 'Argentina'].drop(columns={'ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup','avg fob orders sinmarkup >100','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','avg fob orders sinmarkup >200',1.0000,2.0000,3,'CABA CoAr','Interior CoAr'})
+melted_argentina_mkt = argentina_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_argentina_mkt.drop(columns={'country'},inplace=True)
+
+Coar_mkt = merge_mkt.loc[merge_mkt['country'] == 'Arg Coar'].drop(columns={'ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders markup >200','orders >= 200 sinmarkup', 'avg fob orders sinmarkup >200','CABA Arg','Interior Arg',1.0000,2.0000,3})
+melted_Coar_mkt = Coar_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_Coar_mkt.drop(columns={'country'},inplace=True)
+
+brazil_mkt = merge_mkt.loc[merge_mkt['country'] == 'Brazil'].drop(columns={'ursec',1.0000,2.0000,3,'CABA Arg','Interior Arg','CABA CoAr','Interior CoAr','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','avg fob orders sinmarkup >200'})
+melted_brazil_mkt = brazil_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_brazil_mkt.drop(columns={'country'},inplace=True)
+
+ecuador_mkt = merge_mkt.loc[merge_mkt['country'] == 'Ecuador'].drop(columns={'ursec',1.0000,2.0000,3,'CABA Arg','Interior Arg','CABA CoAr','Interior CoAr','orders >= 200 markup','orders >= 200 sinmarkup','avg fob orders markup >200','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup','avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders sinmarkup >200'})
+melted_ecuador_mkt = ecuador_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_ecuador_mkt.drop(columns={'country'},inplace=True)
+
+imports_mkt = merge_mkt.loc[(merge_mkt['country'] == 'Imports_avion')|(merge_mkt['country'] == 'Imports_barco')].drop(columns={'orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders markup >200','orders >= 200 sinmarkup', 'avg fob orders sinmarkup >200','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg',1.0000,2.0000,3})
+melted_imports_mkt = imports_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_imports_mkt.drop(columns={'country'},inplace=True)
+
+peru_mkt = merge_mkt.loc[merge_mkt['country'] == 'Peru'].drop(columns={'ursec','orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg',1.0000,2.0000,3})                                                                                              
+melted_peru_mkt = peru_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_peru_mkt.drop(columns={'country'},inplace=True)
+
+uruguay_mkt = merge_mkt.loc[merge_mkt['country'] == 'Uruguay'].drop(columns={'orders >= 100 markup','avg fob orders markup >100','orders >= 100 sinmarkup', 'avg fob orders sinmarkup >100','orders >= 200 markup','avg fob orders markup >200','orders >= 200 sinmarkup', 'avg fob orders sinmarkup >200','CABA CoAr','Interior CoAr','CABA Arg','Interior Arg'})                                                                                                          
+melted_uruguay_mkt = uruguay_mkt.melt(id_vars=['country'], var_name='column', value_name='value')
+melted_uruguay_mkt.drop(columns={'country'},inplace=True)
+
+tab = sh.worksheet('Arg Coar')
+column_values = melted_Coar_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 48
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Arg CoPriv')
+column_values = melted_argentina_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 48
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Imp')
+column_values = melted_imports_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 69
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Uy')
+column_values = melted_uruguay_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 55
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Bra')
+column_values = melted_brazil_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 52
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Peru')
+column_values = melted_peru_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 52
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+tab = sh.worksheet('Ecu')
+column_values = melted_ecuador_mkt.iloc[:, 1].astype(str).tolist()
+start_row = 44
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, [[value] for value in column_values])
+
+
+###################################### modificar ###########################
+
+merge_mixtas = mixtas_df.copy()
+merge_mixtas['Legacy'] = round(merge_mixtas['legacy']*100,2)
+merge_mixtas['Mkt'] = round(merge_mixtas['mkt']*100,2)
+merge_mixtas = merge_mixtas[['country','Legacy','Mkt']]
+
+merge_mixtas_values = merge_mixtas.values.tolist()
+
+tab = sh.worksheet('% mixtas')
+#Cambiar cada mes 4B
+start_row = 23
+start_column = 17
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, merge_mixtas_values)
+
+
+###################################### modificar ###########################
+
+
+
+group_orders = redshift_m1.groupby(['country']).agg({
+    'order_id':'nunique',
+    'qty_ordered':'sum'}).reset_index()
+
+group_orders=group_orders.astype(str)
+group_orders_values = group_orders.values.tolist()
+tab = sh.worksheet('control')
+#Controlar cada mes
+start_row = 28
+start_column = 17
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, group_orders_values)
+
+
+###################################### modificar ###########################
+
+sh = gc.open('raw_data_simulador_25')
+
+raw_1 = redshift_m1#.merge(brightpear_tax_ordes,'left','order_id')
+
+paste_raw = raw_1[['Tax date','order_id','sku','qty_ordered','weight','so_price','po_price','courier','markup','mixta','created_at_gmt_3','country','Warehouse']]
+paste_raw['Warehouse'].loc[(paste_raw['Warehouse']=='nan') & (paste_raw['country'] == 'Uruguay')] = 'Miami'
+
+country_mapping = {'Brazil':'13',
+    'Peru':'16',
+     'Uruguay':'20',
+     'Arg Coar':'25',
+     'Argentina':'25',
+     'Ecuador':'26',
+     'Imports_avion':'21',
+     'Imports_barco':'21',
+    'Costa Rica':'CR'}
+
+paste_raw['country'] = paste_raw['country'].map(country_mapping)
+
+paste_raw['vendor'] = paste_raw['sku'].apply(lambda x: x.split('-')[0])
+
+paste_raw = paste_raw.astype(str)
+paste_raw_values = paste_raw.values.tolist()
+#Controlar 4B
+tab = sh.worksheet('marzo')
+start_row = 2
+start_column = 1
+start_cell = gspread.utils.rowcol_to_a1(start_row, start_column)
+tab.update(start_cell, paste_raw_values)
